@@ -110,10 +110,13 @@ def get_momo_session() -> requests.Session:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_momo(keyword: str, page: int) -> list:
-    """momo：抓單一頁。"""
-    resp = get_momo_session().post(
-        MOMO_URL, json=build_momo_payload(keyword, page), timeout=15
+    """momo：抓單一頁。先用老師程式的最簡寫法（只帶 User-Agent），被 403 擋下再改用瀏覽器式 Session。"""
+    payload = build_momo_payload(keyword, page)
+    resp = requests.post(
+        MOMO_URL, headers={"User-Agent": MOMO_HEADERS["User-Agent"]}, json=payload, timeout=15
     )
+    if resp.status_code == 403:
+        resp = get_momo_session().post(MOMO_URL, json=payload, timeout=15)
     resp.raise_for_status()
     goods = (resp.json().get("rtnSearchData") or {}).get("goodsInfoList") or []
     time.sleep(REQUEST_DELAY)
@@ -143,9 +146,16 @@ def collect(keyword: str, platforms: list, pages: int):
                 bar.progress(done / total, text=f"{plat}：正在抓取第 {page} / {pages} 頁…")
                 try:
                     items = FETCHERS[plat](keyword, page)
+                except requests.HTTPError as e:
+                    code = e.response.status_code if e.response is not None else "?"
+                    errors[plat] = (
+                        f"對方回應 {code}（拒絕連線）。部署在雲端時容易被擋，在自己電腦執行可能就正常"
+                        if code == 403 else str(e)
+                    )
+                    break  # 這個平台放棄，換下一個
                 except (requests.RequestException, ValueError) as e:
                     errors[plat] = str(e)
-                    break  # 這個平台放棄，換下一個
+                    break
                 done += 1
                 if not items:  # 這一頁沒資料，後面也不會有
                     done += pages - page
@@ -168,6 +178,17 @@ def parse_price(value):
     return int(m.group(0).replace(",", "")) if m else None
 
 
+BRAND_ALIAS = {"明基": "BENQ", "飛利浦": "PHILIPS", "歐司朗": "OSRAM"}
+
+
+def normalize_brand(tag: str) -> str:
+    """同一品牌的不同寫法合併：'BenQ 明基'、'BENQ' → 'BENQ'；'歐司朗 OSRAM' → 'OSRAM'。"""
+    m = re.search(r"[A-Za-z][A-Za-z0-9\-]+", tag)
+    if m:
+        return m.group(0).upper()
+    return BRAND_ALIAS.get(tag.strip(), tag.strip())
+
+
 def extract_brand(text) -> str:
     """從文字猜品牌：優先【品牌】，其次開頭的英文字，抓不到就是「其他」。"""
     if not isinstance(text, str) or not text.strip():
@@ -178,12 +199,12 @@ def extract_brand(text) -> str:
     for m in tags:
         t = m.group(1).strip()
         if len(t) <= 12 and not any(w in t for w in STORE_WORDS + PROMO_WORDS):
-            return t.upper() if t.isascii() else t
+            return normalize_brand(t)
 
     rest = first[tags[-1].end():].strip() if tags else first.strip()
     m = re.match(r"[A-Za-z][A-Za-z0-9\-]+", rest)
     if m and m.group(0).upper() not in NOT_BRAND:
-        return m.group(0).upper()
+        return normalize_brand(m.group(0))
     return "其他"
 
 
@@ -237,78 +258,52 @@ def brand_stats(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_insights(df: pd.DataFrame) -> dict:
+    """重點結論：每條只寫一句，數字全部由資料算出。"""
     n = len(df)
     plats = list(df["平台"].unique())
-    med, avg = df["價格"].median(), df["價格"].mean()
+    med = df["價格"].median()
     q1, q3 = df["價格"].quantile([0.25, 0.75])
-    pmin, pmax = df["價格"].min(), df["價格"].max()
     summary = []
 
     # 1) 價格概況
-    if avg > med * 1.1:
-        shape = "平均高於中位數，代表少數高價商品把平均拉高，抓預算時看中位價比較準"
-    elif avg < med * 0.9:
-        shape = "平均低於中位數，代表有一批低價商品把平均拉低"
-    else:
-        shape = "平均與中位數很接近，價格分布算平均"
     summary.append(
-        f"**價格概況**：中位價 {money(med)}、平均 {money(avg)}（{shape}）；"
-        f"最便宜 {money(pmin)}，最貴 {money(pmax)}，相差約 {pmax / pmin:.1f} 倍。"
+        f"**價格**：中位價 {money(med)}，最低 {money(df['價格'].min())}、最高 {money(df['價格'].max())}。"
     )
 
     # 2) 主流價位
     bc = band_counts(df)
-    top_band = bc.idxmax()
     summary.append(
-        f"**主流價位**：中間五成的商品落在 {money(q1)} ~ {money(q3)}；"
-        f"最多商品集中在 {top_band}（佔 {bc.max() / n:.0%}）。"
+        f"**主流價位**：{money(q1)} ~ {money(q3)}，最多集中在 {bc.idxmax()}（{bc.max() / n:.0%}）。"
     )
 
     # 3) 平台比較
     parts = []
     for pl in plats:
         vc = df[df["平台"] == pl]["價格區間"].astype(str).value_counts(normalize=True)
-        parts.append(f"{pl} 有 {vc.iloc[0]:.0%} 的商品落在 {vc.index[0]}")
-    pie_text = "；".join(parts)
+        parts.append(f"{pl} {vc.iloc[0]:.0%} 落在 {vc.index[0]}")
+    pie_text = "；".join(parts) + "。"
     if len(plats) >= 2:
         pm = df.groupby("平台")["價格"].median().sort_values()
-        cheap, pricey = pm.index[0], pm.index[-1]
         diff = (pm.iloc[-1] - pm.iloc[0]) / pm.iloc[-1]
         if diff < 0.05:
-            summary.append(
-                f"**平台比較**：{cheap} 與 {pricey} 的中位價只差約 {diff:.0%}，整體價位相近。"
-            )
+            summary.append("**平台比較**：兩平台中位價相近（差不到 5%）。")
         else:
             summary.append(
-                f"**平台比較**：{cheap} 的中位價（{money(pm.iloc[0])}）比 {pricey}"
-                f"（{money(pm.iloc[-1])}）低約 {diff:.0%}。"
-                "（比的是整體價位，不保證是同款商品。）"
+                f"**平台比較**：{pm.index[0]} 中位價比 {pm.index[-1]} 低約 {diff:.0%}（不一定是同款）。"
             )
-        below = df.assign(便宜=df["價格"] < med).groupby("平台")["便宜"].mean()
-        pie_text += "。低於整體中位價的商品比例：" + "、".join(
-            f"{pl} {below[pl]:.0%}" for pl in plats
-        )
 
     # 4) 品牌觀察
     bs = brand_stats(df)
-    sun_text = ""
+    big = df.groupby(["平台", df["價格區間"].astype(str)]).size().idxmax()
+    sun_text = f"最大一塊：{big[0]} → {big[1]}。"
     if not bs.empty:
         most = bs.sort_values(["件數", "中位價"], ascending=[False, True]).iloc[0]
-        cheapest = bs.sort_values("中位價").iloc[0]
-        priciest = bs.sort_values("中位價").iloc[-1]
-        sun_text = (
-            f"商品最多的品牌是 {most['品牌']}（{int(most['件數'])} 件，中位價 {money(most['中位價'])}）"
-        )
-        line = f"**品牌觀察**：{sun_text}"
-        if cheapest["品牌"] != priciest["品牌"]:
-            line += (
-                f"；中位價最低的是 {cheapest['品牌']}（{money(cheapest['中位價'])}），"
-                f"最高的是 {priciest['品牌']}（{money(priciest['中位價'])}）"
-            )
-            sun_text += f"；中位價最高的品牌是 {priciest['品牌']}"
-        summary.append(line + "。（只統計出現 2 件以上、且判斷得出品牌的商品。）")
-    big = df.groupby(["平台", df["價格區間"].astype(str)]).size().idxmax()
-    sun_text = (f"最大的一塊是「{big[0]} → {big[1]}」。" + sun_text).rstrip("；")
+        lo, hi = bs.sort_values("中位價").iloc[0], bs.sort_values("中位價").iloc[-1]
+        line = f"**品牌**：最多的是 {most['品牌']}（{int(most['件數'])} 件）"
+        if lo["品牌"] != hi["品牌"]:
+            line += f"；中位價最低 {lo['品牌']}、最高 {hi['品牌']}"
+        summary.append(line + "。")
+        sun_text += f"商品最多的品牌是 {most['品牌']}。"
 
     # 5) 排名與價格
     line_text = ""
@@ -317,20 +312,19 @@ def build_insights(df: pd.DataFrame) -> dict:
         r = pos.corr(df["價格"].rank(pct=True))
         if pd.notna(r):
             if r <= -0.2:
-                rel = "搜尋結果排越前面的商品，價格傾向越高"
+                rel = "排越前面的商品價格傾向越高"
             elif r >= 0.2:
-                rel = "搜尋結果排越前面的商品，價格傾向越低"
+                rel = "排越前面的商品價格傾向越低"
             else:
-                rel = "排名和價格幾乎沒有關係，前面的商品不一定比較貴或比較便宜"
+                rel = "排名和價格幾乎沒關係"
             line_text = rel + "。"
-            summary.append(f"**排名與價格**：{rel}。")
-    means = "、".join(f"{pl} 平均 {money(df[df['平台'] == pl]['價格'].mean())}" for pl in plats)
-    line_text += f"虛線是各平台平均價：{means}。"
+            summary.append(f"**排名**：{rel}。")
+    means = "、".join(f"{pl} {money(df[df['平台'] == pl]['價格'].mean())}" for pl in plats)
+    line_text += f"虛線為平均價：{means}。"
 
     if n < 20:
-        summary.append(f"**提醒**：目前只有 {n} 件資料，樣本偏少，結論僅供參考。")
-    return {"summary": summary, "line": line_text, "pie": pie_text + "。", "sunburst": sun_text + "。"}
-
+        summary.append(f"**提醒**：只有 {n} 件資料，結論僅供參考。")
+    return {"summary": summary, "line": line_text, "pie": pie_text, "sunburst": sun_text}
 
 # ----------------------------------------------------------------------
 # 圖表（Plotly）
