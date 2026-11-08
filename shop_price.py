@@ -20,6 +20,16 @@ import streamlit as st
 PCHOME_URL = "https://ecshweb.pchome.com.tw/search/v3.3/all/results"
 MOMO_URL = "https://apisearch.momoshop.com.tw/momoSearchCloud/moec/textSearch"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+# momo 的 header 盡量像一般瀏覽器（UA 沿用老師程式碼），降低被 403 擋下的機會
+MOMO_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    "Origin": "https://www.momoshop.com.tw",
+    "Referer": "https://www.momoshop.com.tw/",
+}
 REQUEST_DELAY = 1.5  # 每抓一頁後休息幾秒，避免被網站封鎖
 PLATFORMS = ["PChome", "momo"]
 PLATFORM_COLORS = {"PChome": "#6366F1", "momo": "#F43F5E"}
@@ -86,11 +96,23 @@ def build_momo_payload(keyword: str, page: int) -> dict:
     }
 
 
+@st.cache_resource(show_spinner=False)
+def get_momo_session() -> requests.Session:
+    """建立 momo 專用 Session：先逛一次首頁拿 cookie，比較像一般瀏覽器。"""
+    s = requests.Session()
+    s.headers.update(MOMO_HEADERS)
+    try:
+        s.get("https://www.momoshop.com.tw/", timeout=10)
+    except requests.RequestException:
+        pass  # 首頁連不上也沒關係，後面的搜尋請求會自己報錯
+    return s
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_momo(keyword: str, page: int) -> list:
     """momo：抓單一頁。"""
-    resp = requests.post(
-        MOMO_URL, headers=HEADERS, json=build_momo_payload(keyword, page), timeout=15
+    resp = get_momo_session().post(
+        MOMO_URL, json=build_momo_payload(keyword, page), timeout=15
     )
     resp.raise_for_status()
     goods = (resp.json().get("rtnSearchData") or {}).get("goodsInfoList") or []
@@ -107,6 +129,19 @@ def fetch_momo(keyword: str, page: int) -> list:
 
 
 FETCHERS = {"PChome": fetch_pchome, "momo": fetch_momo}
+
+
+def read_momo_csv(file) -> list:
+    """讀取 momo CSV（老師程式產生的 MOMO_*.csv，欄位是「品名」「價格」），轉成同一種格式。"""
+    data = pd.read_csv(file)
+    name_col = next((c for c in ("品名", "商品名稱", "name") if c in data.columns), None)
+    price_col = next((c for c in ("價格", "price") if c in data.columns), None)
+    if name_col is None or price_col is None:
+        raise ValueError("CSV 需要有「品名」和「價格」兩個欄位")
+    return [
+        {"id": f"csv{i}", "name": str(n), "price": p, "text": str(n), "平台": "momo"}
+        for i, (n, p) in enumerate(zip(data[name_col], data[price_col]))
+    ]
 
 
 def collect(keyword: str, platforms: list, pages: int):
@@ -449,7 +484,8 @@ def platform_table(df: pd.DataFrame) -> pd.DataFrame:
 
 def show_dashboard(keyword: str, df: pd.DataFrame, errors: dict) -> None:
     for plat, msg in errors.items():
-        st.warning(f"{plat} 連線失敗，目前沒有它的資料。（{msg}）")
+        hint = "可以在左側「上傳 momo CSV」改用檔案。" if plat == "momo" else ""
+        st.warning(f"{plat} 連線失敗，目前沒有它的資料。{hint}（{msg}）")
 
     ins = build_insights(df)
     show_cards(df)
@@ -499,6 +535,11 @@ def main() -> None:
         keyword = st.text_input("商品關鍵字", value="螢幕掛燈")
         platforms = st.multiselect("平台", PLATFORMS, default=PLATFORMS)
         pages = st.slider("爬取頁數（每頁約 20 件）", min_value=1, max_value=10, value=2)
+        momo_file = st.file_uploader(
+            "上傳 momo CSV（選填）", type="csv",
+            help="momo 連不上時，可上傳老師程式產生的 MOMO_*.csv（欄位：品名、價格），"
+                 "上傳後 momo 就不再連網，直接用檔案內容。",
+        )
         search = st.button("開始查詢", type="primary")
         st.caption(f"每頁間隔 {REQUEST_DELAY} 秒，避免被網站封鎖。")
 
@@ -509,7 +550,14 @@ def main() -> None:
         elif not platforms:
             st.warning("請至少選擇一個平台。")
         else:
-            rows, errors = collect(kw, platforms, pages)
+            use_file = momo_file is not None and "momo" in platforms
+            online = [p for p in platforms if not (p == "momo" and use_file)]
+            rows, errors = collect(kw, online, pages) if online else ([], {})
+            if use_file:
+                try:
+                    rows += read_momo_csv(momo_file)
+                except (ValueError, pd.errors.ParserError, UnicodeDecodeError) as e:
+                    errors["momo"] = f"CSV 讀取失敗：{e}"
             df = prepare(rows) if rows else pd.DataFrame()
             if df.empty:
                 st.session_state.pop("result", None)
