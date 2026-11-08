@@ -131,19 +131,6 @@ def fetch_momo(keyword: str, page: int) -> list:
 FETCHERS = {"PChome": fetch_pchome, "momo": fetch_momo}
 
 
-def read_momo_csv(file) -> list:
-    """讀取 momo CSV（老師程式產生的 MOMO_*.csv，欄位是「品名」「價格」），轉成同一種格式。"""
-    data = pd.read_csv(file)
-    name_col = next((c for c in ("品名", "商品名稱", "name") if c in data.columns), None)
-    price_col = next((c for c in ("價格", "price") if c in data.columns), None)
-    if name_col is None or price_col is None:
-        raise ValueError("CSV 需要有「品名」和「價格」兩個欄位")
-    return [
-        {"id": f"csv{i}", "name": str(n), "price": p, "text": str(n), "平台": "momo"}
-        for i, (n, p) in enumerate(zip(data[name_col], data[price_col]))
-    ]
-
-
 def collect(keyword: str, platforms: list, pages: int):
     """依序抓取各平台多頁。回傳 (資料列, {平台: 錯誤訊息})。某平台失敗不影響另一個。"""
     rows, errors = [], {}
@@ -484,8 +471,7 @@ def platform_table(df: pd.DataFrame) -> pd.DataFrame:
 
 def show_dashboard(keyword: str, df: pd.DataFrame, errors: dict) -> None:
     for plat, msg in errors.items():
-        hint = "可以在左側「上傳 momo CSV」改用檔案。" if plat == "momo" else ""
-        st.warning(f"{plat} 連線失敗，目前沒有它的資料。{hint}（{msg}）")
+        st.warning(f"{plat} 連線失敗，目前沒有它的資料。（{msg}）")
 
     ins = build_insights(df)
     show_cards(df)
@@ -535,11 +521,6 @@ def main() -> None:
         keyword = st.text_input("商品關鍵字", value="螢幕掛燈")
         platforms = st.multiselect("平台", PLATFORMS, default=PLATFORMS)
         pages = st.slider("爬取頁數（每頁約 20 件）", min_value=1, max_value=10, value=2)
-        momo_file = st.file_uploader(
-            "上傳 momo CSV（選填）", type="csv",
-            help="momo 連不上時，可上傳老師程式產生的 MOMO_*.csv（欄位：品名、價格），"
-                 "上傳後 momo 就不再連網，直接用檔案內容。",
-        )
         search = st.button("開始查詢", type="primary")
         st.caption(f"每頁間隔 {REQUEST_DELAY} 秒，避免被網站封鎖。")
 
@@ -550,14 +531,7 @@ def main() -> None:
         elif not platforms:
             st.warning("請至少選擇一個平台。")
         else:
-            use_file = momo_file is not None and "momo" in platforms
-            online = [p for p in platforms if not (p == "momo" and use_file)]
-            rows, errors = collect(kw, online, pages) if online else ([], {})
-            if use_file:
-                try:
-                    rows += read_momo_csv(momo_file)
-                except (ValueError, pd.errors.ParserError, UnicodeDecodeError) as e:
-                    errors["momo"] = f"CSV 讀取失敗：{e}"
+            rows, errors = collect(kw, platforms, pages)
             df = prepare(rows) if rows else pd.DataFrame()
             if df.empty:
                 st.session_state.pop("result", None)
