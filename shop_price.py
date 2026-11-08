@@ -13,6 +13,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from curl_cffi import requests as cffi_requests  # momo 需要模擬 Chrome 的 TLS 指紋
 
 # ----------------------------------------------------------------------
 # 基本設定
@@ -20,13 +21,11 @@ import streamlit as st
 PCHOME_URL = "https://ecshweb.pchome.com.tw/search/v3.3/all/results"
 MOMO_URL = "https://apisearch.momoshop.com.tw/momoSearchCloud/moec/textSearch"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-# momo 的 header 盡量像一般瀏覽器（UA 沿用老師程式碼），降低被 403 擋下的機會
+# momo 的 header（沿用老師程式碼）
 MOMO_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-    "Content-Type": "application/json",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    "Content-Type": "application/json;charset=UTF-8",
     "Origin": "https://www.momoshop.com.tw",
     "Referer": "https://www.momoshop.com.tw/",
 }
@@ -71,52 +70,51 @@ def fetch_pchome(keyword: str, page: int) -> list:
 
 
 def build_momo_payload(keyword: str, page: int) -> dict:
-    """momo 搜尋用的 payload（欄位沿用原始 CODE，關鍵字與頁碼改成可變）。"""
+    """momo 搜尋用的 payload（沿用老師程式碼，關鍵字與頁碼改成可變）。"""
     return {
         "host": "momoshop",
         "flag": "searchEngine",
         "data": {
-            "specialGoodsType": "", "isBrandSeriesPage": "false", "authorNo": "",
-            "originalCateCode": "", "cateType": "", "searchValue": keyword,
-            "cateCode": "", "cateLevel": "-1", "cp": "N", "NAM": "N", "first": "N",
-            "freeze": "N", "superstore": "N", "tvshop": "N", "china": "N",
-            "tomorrow": "N", "stockYN": "N", "prefere": "N", "threeHours": "N",
-            "video": "N", "cycle": "N", "cod": "N", "superstorePay": "N",
-            "showType": "chessboardType", "curPage": str(page),
-            "priceS": "0", "priceE": "9999999", "searchType": "1",
-            "reduceKeyword": "", "isFuzzy": "0",
+            "searchValue": keyword,
+            "searchType": "1",
+            "cateLevel": "-1",
+            "curPage": str(page),
+            "priceS": "0",
+            "priceE": "9999999",
+            "showType": "chessboardType",
+            "isFuzzy": "0",
             "rtnCateDatainfo": {
-                "cateCode": "", "cateLv": "-1", "keyword": keyword,
-                "curPage": str(page), "historyDoPush": "false",
-                "timestamp": int(time.time() * 1000),
+                "cateCode": "",
+                "cateLv": "-1",
+                "keyword": keyword,
+                "curPage": str(page),  # 與外層一致
+                "historyDoPush": "false",
+                "timestamp": int(time.time() * 1000),  # 用當下時間
             },
-            "flag": 2018, "serviceCode": "MT01", "addressSearchData": {},
-            "adSource": "tenmax",
+            "flag": 2018,
+            "serviceCode": "MT01",
+            "addressSearchData": {},
         },
     }
 
 
 @st.cache_resource(show_spinner=False)
-def get_momo_session() -> requests.Session:
-    """建立 momo 專用 Session：先逛一次首頁拿 cookie，比較像一般瀏覽器。"""
-    s = requests.Session()
-    s.headers.update(MOMO_HEADERS)
+def get_momo_session():
+    """建立 momo 專用 Session：模擬 Chrome 的 TLS 指紋，並先逛首頁取得 cookie。"""
+    session = cffi_requests.Session(impersonate="chrome")
     try:
-        s.get("https://www.momoshop.com.tw/", timeout=10)
-    except requests.RequestException:
+        session.get("https://www.momoshop.com.tw/", headers=MOMO_HEADERS, timeout=10)
+    except Exception:
         pass  # 首頁連不上也沒關係，後面的搜尋請求會自己報錯
-    return s
+    return session
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_momo(keyword: str, page: int) -> list:
-    """momo：抓單一頁。先用老師程式的最簡寫法（只帶 User-Agent），被 403 擋下再改用瀏覽器式 Session。"""
-    payload = build_momo_payload(keyword, page)
-    resp = requests.post(
-        MOMO_URL, headers={"User-Agent": MOMO_HEADERS["User-Agent"]}, json=payload, timeout=15
+    """momo：抓單一頁。"""
+    resp = get_momo_session().post(
+        MOMO_URL, headers=MOMO_HEADERS, json=build_momo_payload(keyword, page), timeout=15
     )
-    if resp.status_code == 403:
-        resp = get_momo_session().post(MOMO_URL, json=payload, timeout=15)
     resp.raise_for_status()
     goods = (resp.json().get("rtnSearchData") or {}).get("goodsInfoList") or []
     time.sleep(REQUEST_DELAY)
@@ -146,16 +144,10 @@ def collect(keyword: str, platforms: list, pages: int):
                 bar.progress(done / total, text=f"{plat}：正在抓取第 {page} / {pages} 頁…")
                 try:
                     items = FETCHERS[plat](keyword, page)
-                except requests.HTTPError as e:
-                    code = e.response.status_code if e.response is not None else "?"
-                    errors[plat] = (
-                        f"對方回應 {code}（拒絕連線）。部署在雲端時容易被擋，在自己電腦執行可能就正常"
-                        if code == 403 else str(e)
-                    )
-                    break  # 這個平台放棄，換下一個
-                except (requests.RequestException, ValueError) as e:
+                except (requests.RequestException, cffi_requests.exceptions.RequestException,
+                        ValueError) as e:
                     errors[plat] = str(e)
-                    break
+                    break  # 這個平台放棄，換下一個
                 done += 1
                 if not items:  # 這一頁沒資料，後面也不會有
                     done += pages - page
