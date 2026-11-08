@@ -31,9 +31,12 @@ MOMO_HEADERS = {
 }
 REQUEST_DELAY = 1.5  # 每抓一頁後休息幾秒，避免被網站封鎖
 PLATFORMS = ["PChome", "momo"]
-PLATFORM_COLORS = {"PChome": "#6366F1", "momo": "#F43F5E"}
+PLATFORM_COLORS = {"PChome": "#8B7CF6", "momo": "#F472B6"}
 # 價格區間用「由淺到深」的顏色，越深代表越貴（中文由瀏覽器顯示，不需安裝字型）
-BAND_COLORS = ["#C7D2FE", "#A5B4FC", "#818CF8", "#6366F1", "#4338CA", "#312E81", "#1E1B4B"]
+BAND_COLORS = ["#FFE5EF", "#FFC2DC", "#FF9EC7", "#F27BB0", "#C77DDB", "#9B6DD6", "#6D4FB5"]
+# 旭日圖的顏色：淡粉（便宜）→ 玫瑰粉 → 薰衣草紫（貴）
+SUNBURST_SCALE = ["#FFE8F1", "#FFC0DA", "#F78FBE", "#D58BE0", "#9E7BE6"]
+CROWN = "♛"  # 皇冠（文字符號，不是 emoji）
 CHART_FONT = "Noto Sans TC, Microsoft JhengHei, PingFang TC, sans-serif"
 
 STORE_WORDS = ("購物", "商城", "旗艦", "官方", "專賣", "商店", "館")
@@ -249,6 +252,32 @@ def brand_stats(df: pd.DataFrame) -> pd.DataFrame:
     return b[b["件數"] >= 2].reset_index()
 
 
+def brand_compare(df: pd.DataFrame) -> pd.DataFrame:
+    """兩個平台都有賣的品牌：比較中位價，標出買哪裡最划算（價差小於 5% 視為相近）。"""
+    plats = list(df["平台"].unique())
+    if len(plats) < 2:
+        return pd.DataFrame()
+    d = df[df["品牌"] != "其他"]
+    med = d.pivot_table(index="品牌", columns="平台", values="價格", aggfunc="median").reindex(columns=plats)
+    cnt = d.pivot_table(index="品牌", columns="平台", values="價格", aggfunc="size").reindex(columns=plats)
+    rows = []
+    for b in med.dropna().index:
+        prices = med.loc[b]
+        save = (prices.max() - prices.min()) / prices.max()
+        best = prices.idxmin() if save >= 0.05 else None
+        rows.append({
+            "品牌": b,
+            **{f"{pl} 中位價": int(prices[pl]) for pl in plats},
+            "最划算": f"{CROWN} {best}" if best else "價格相近",
+            "便宜幅度": f"{save:.0%}" if best else "-",
+            "件數": int(cnt.loc[b].sum()),
+            "_best": best,
+        })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("件數", ascending=False).reset_index(drop=True)
+
+
 def build_insights(df: pd.DataFrame) -> dict:
     """重點結論：每條只寫一句，數字全部由資料算出。"""
     n = len(df)
@@ -284,6 +313,13 @@ def build_insights(df: pd.DataFrame) -> dict:
                 f"**平台比較**：{pm.index[0]} 中位價比 {pm.index[-1]} 低約 {diff:.0%}（不一定是同款）。"
             )
 
+    # 3.5) 買哪裡最划算（皇冠）
+    cmp = brand_compare(df)
+    if not cmp.empty:
+        wins = cmp["_best"].value_counts()
+        won = "、".join(f"{pl} {wins[pl]} 個" for pl in plats if pl in wins.index) or "沒有明顯差異"
+        summary.append(f"**買哪裡**：{len(cmp)} 個品牌兩邊都有賣，{CROWN} 較划算：{won}（見「品牌比價」）。")
+
     # 4) 品牌觀察
     bs = brand_stats(df)
     big = df.groupby(["平台", df["價格區間"].astype(str)]).size().idxmax()
@@ -311,8 +347,8 @@ def build_insights(df: pd.DataFrame) -> dict:
                 rel = "排名和價格幾乎沒關係"
             line_text = rel + "。"
             summary.append(f"**排名**：{rel}。")
-    means = "、".join(f"{pl} {money(df[df['平台'] == pl]['價格'].mean())}" for pl in plats)
-    line_text += f"虛線為平均價：{means}。"
+    means = "　｜　".join(f"**{pl} 平均 {money(df[df['平台'] == pl]['價格'].mean())}**" for pl in plats)
+    line_text += ("\n\n" if line_text else "") + f"虛線＝各平台平均價：{means}"
 
     if n < 20:
         summary.append(f"**提醒**：只有 {n} 件資料，結論僅供參考。")
@@ -333,9 +369,9 @@ def _style(fig: go.Figure, title: str, height: int = 540) -> go.Figure:
 
 def line_chart(df: pd.DataFrame, keyword: str) -> go.Figure:
     fig = go.Figure()
-    for pl in df["平台"].unique():
+    for i, pl in enumerate(df["平台"].unique()):
         sub = df[df["平台"] == pl]
-        color = PLATFORM_COLORS.get(pl, "#10B981")
+        color = PLATFORM_COLORS.get(pl, "#A78BFA")
         fig.add_trace(
             go.Scatter(
                 x=sub["排序"], y=sub["價格"], name=pl, mode="lines+markers",
@@ -347,8 +383,11 @@ def line_chart(df: pd.DataFrame, keyword: str) -> go.Figure:
         mean = sub["價格"].mean()
         fig.add_hline(
             y=mean, line=dict(color=color, dash="dash", width=1.5),
-            annotation_text=f"{pl} 平均 ${mean:,.0f}", annotation_font_color=color,
-            annotation_position="top right",
+            annotation_text=f"<b>{pl} 平均 ${mean:,.0f}</b>",
+            annotation_font=dict(color=color, size=15),
+            annotation_bgcolor="rgba(255,255,255,0.92)",
+            annotation_bordercolor=color, annotation_borderpad=4,
+            annotation_position="top left" if i % 2 == 0 else "top right",  # 兩個平台分在左右，不會擠在一起
         )
     fig.update_xaxes(title="排序（各平台搜尋結果的出現順序）")
     fig.update_yaxes(title="價格 (NT$)")
@@ -382,7 +421,7 @@ def pie_chart(df: pd.DataFrame, keyword: str) -> go.Figure:
         fig.add_annotation(x=cx, y=0.45, text=f"<b>{int(cnt.sum())}</b><br>件",
                            showarrow=False, font=dict(size=20))
         fig.add_annotation(x=cx, y=1.0, text=f"<b>{pl}</b>", showarrow=False,
-                           font=dict(size=18, color=PLATFORM_COLORS.get(pl, "#10B981")))
+                           font=dict(size=18, color=PLATFORM_COLORS.get(pl, "#A78BFA")))
     return _style(fig, f"「{keyword}」價格區間佔比（顏色越深越貴）", height=520)
 
 
@@ -390,14 +429,31 @@ def sunburst_chart(df: pd.DataFrame, keyword: str) -> go.Figure:
     data = df.assign(商品數=1, 價格區間=df["價格區間"].astype(str))
     fig = px.sunburst(
         data, path=["平台", "價格區間", "品牌"], values="商品數",
-        color="價格", color_continuous_scale="Viridis",
+        color="價格", color_continuous_scale=SUNBURST_SCALE,
     )
     fig.update_traces(
         hovertemplate="<b>%{label}</b><br>商品數 %{value}<br>平均價 $%{color:,.0f}<extra></extra>",
         insidetextorientation="radial",
     )
+    fig.update_traces(marker_line=dict(color="white", width=1.5))
     fig.update_coloraxes(colorbar_title="平均價<br>NT$")
     return _style(fig, f"「{keyword}」平台 → 價格區間 → 品牌（顏色＝平均價）", height=620)
+
+
+def brand_chart(cmp: pd.DataFrame, plats: list, keyword: str) -> go.Figure:
+    top = cmp.head(10)
+    fig = go.Figure()
+    for pl in plats:
+        vals = top[f"{pl} 中位價"]
+        texts = [f"<b>{CROWN} ${v:,}</b>" if b == pl else f"${v:,}" for v, b in zip(vals, top["_best"])]
+        fig.add_trace(go.Bar(
+            x=top["品牌"], y=vals, name=pl, marker_color=PLATFORM_COLORS.get(pl, "#A78BFA"),
+            text=texts, textposition="outside", cliponaxis=False,
+            hovertemplate="%{x}<br>" + pl + " 中位價 $%{y:,}<extra></extra>",
+        ))
+    fig.update_layout(barmode="group", legend=dict(orientation="h", y=1.08, x=0))
+    fig.update_yaxes(title="中位價 (NT$)")
+    return _style(fig, f"「{keyword}」各品牌中位價比較（{CROWN} ＝ 買這裡比較划算）", height=520)
 
 
 # ----------------------------------------------------------------------
@@ -407,9 +463,9 @@ CSS = """
 <style>
 .block-container {padding-top: 2rem;}
 .hero {
-    background: linear-gradient(120deg, #6366F1 0%, #F43F5E 100%);
+    background: linear-gradient(120deg, #A78BFA 0%, #F472B6 100%);
     border-radius: 18px; padding: 28px 34px; color: #fff; margin-bottom: 22px;
-    box-shadow: 0 8px 24px rgba(99,102,241,.25);
+    box-shadow: 0 8px 24px rgba(244,114,182,.28);
 }
 .hero h1 {margin: 0; font-size: 2rem; color: #fff;}
 .hero p {margin: 6px 0 0; opacity: .92; font-size: 1.02rem;}
@@ -439,10 +495,10 @@ def show_cards(df: pd.DataFrame) -> None:
     top = df.loc[df["價格"].idxmax()]
     low = df.loc[df["價格"].idxmin()]
     items = [
-        ("商品數量", f"{len(df)} 件", "、".join(df["平台"].unique()), "#6366F1"),
-        ("中位價格", money(df["價格"].median()), f"平均 {money(df['價格'].mean())}", "#06B6D4"),
-        ("最低價格", money(low["價格"]), f"{low['平台']}｜{low['商品名稱']}", "#10B981"),
-        ("最高價格", money(top["價格"]), f"{top['平台']}｜{top['商品名稱']}", "#F43F5E"),
+        ("商品數量", f"{len(df)} 件", "、".join(df["平台"].unique()), "#A78BFA"),
+        ("中位價格", money(df["價格"].median()), f"平均 {money(df['價格'].mean())}", "#F472B6"),
+        ("最低價格", money(low["價格"]), f"{low['平台']}｜{low['商品名稱']}", "#5EEAD4"),
+        ("最高價格", money(top["價格"]), f"{top['平台']}｜{top['商品名稱']}", "#FB7185"),
     ]
     for col, it in zip(st.columns(4), items):
         col.markdown(card(*it), unsafe_allow_html=True)
@@ -453,6 +509,21 @@ def platform_table(df: pd.DataFrame) -> pd.DataFrame:
         商品數="size", 平均價="mean", 中位價="median", 最低價="min", 最高價="max"
     )
     return t.round(0).astype(int).reset_index()
+
+
+def display_table(df: pd.DataFrame) -> pd.DataFrame:
+    """給使用者看的商品表：依價格由低到高，並標出比中位價便宜或貴多少。"""
+    med = df["價格"].median()
+
+    def label(price):
+        g = price / med - 1
+        if abs(g) < 0.02:
+            return "接近中位價"
+        return f"便宜 {abs(g):.0%}" if g < 0 else f"貴 {g:.0%}"
+
+    out = df.assign(比中位價=df["價格"].map(label)).rename(columns={"排序": "搜尋排名"})
+    out = out[["平台", "商品名稱", "品牌", "價格", "比中位價", "搜尋排名"]]
+    return out.sort_values("價格").reset_index(drop=True)
 
 
 def show_dashboard(keyword: str, df: pd.DataFrame, errors: dict) -> None:
@@ -468,7 +539,7 @@ def show_dashboard(keyword: str, df: pd.DataFrame, errors: dict) -> None:
             st.markdown(f"- {s}")
         st.dataframe(platform_table(df), hide_index=True)
 
-    tab1, tab2, tab3, tab4 = st.tabs(["折線圖", "圓餅圖", "旭日圖", "資料表"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["折線圖", "圓餅圖", "旭日圖", "品牌比價", "資料表"])
     with tab1:
         st.plotly_chart(line_chart(df, keyword))
         st.info(ins["line"])
@@ -480,8 +551,25 @@ def show_dashboard(keyword: str, df: pd.DataFrame, errors: dict) -> None:
         st.info(ins["sunburst"])
         st.caption("品牌是從商品名稱或描述自動判斷的，抓不到的歸在「其他」，僅供參考。")
     with tab4:
-        shown = df.assign(價格區間=df["價格區間"].astype(str))
-        st.dataframe(shown, hide_index=True)
+        cmp = brand_compare(df)
+        if df["平台"].nunique() < 2:
+            st.info("要同時選擇 PChome 和 momo，才能比較各品牌在哪裡買比較划算。")
+        elif cmp.empty:
+            st.info("目前沒有「兩個平台都有賣」的品牌，無法比較。")
+        else:
+            st.plotly_chart(brand_chart(cmp, list(df["平台"].unique()), keyword))
+            st.dataframe(cmp.drop(columns="_best"), hide_index=True)
+            st.caption(
+                f"{CROWN} 表示該品牌在這個平台的中位價比較低；價差小於 5% 視為相近。"
+                "比的是品牌整體價位，不一定是同款商品。"
+            )
+    with tab5:
+        shown = display_table(df)
+        st.dataframe(
+            shown, hide_index=True,
+            column_config={"價格": st.column_config.NumberColumn("價格", format="$%d")},
+        )
+        st.caption("預設依價格由低到高排列，點欄位標題可重新排序。")
         st.download_button(
             "下載 CSV",
             shown.to_csv(index=False).encode("utf-8-sig"),  # utf-8-sig：Excel 開啟中文不會亂碼
